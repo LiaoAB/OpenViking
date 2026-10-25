@@ -26,6 +26,7 @@ import httpx
 from openviking.parse.base import NodeType, ParseResult, ResourceNode
 from openviking.parse.image_rewrite import (
     IMAGE_MAPPINGS_FILENAME,
+    IMAGE_PROVENANCE_FILENAME,
     build_artifact_image_mappings,
 )
 from openviking.parse.output import (
@@ -813,7 +814,7 @@ class UnderstandingAPI(BaseParser):
 
                 for child in root_dir.rglob("*"):
                     rel = child.relative_to(root_dir).as_posix()
-                    if child.name in {".", "..", IMAGE_MAPPINGS_FILENAME}:
+                    if child.name in {".", "..", IMAGE_MAPPINGS_FILENAME, IMAGE_PROVENANCE_FILENAME}:
                         continue
                     if child.is_dir():
                         await writer.mkdir(f"{resource_rel}/{rel}")
@@ -827,6 +828,12 @@ class UnderstandingAPI(BaseParser):
                     await writer.write_text(
                         f"{resource_rel}/{IMAGE_MAPPINGS_FILENAME}",
                         json.dumps(image_mappings, ensure_ascii=False),
+                    )
+                provenance_path = root_dir / IMAGE_PROVENANCE_FILENAME
+                if provenance_path.is_file():
+                    await writer.write_bytes(
+                        f"{resource_rel}/{IMAGE_PROVENANCE_FILENAME}",
+                        await asyncio.to_thread(provenance_path.read_bytes),
                     )
         except BaseException:
             try:

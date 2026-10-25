@@ -97,6 +97,14 @@ private URLs fail through the normal LlamaParse error response.
 LlamaParse can complete a job when some pages fail. The bridge keeps the usable Markdown and adds a
 visible failed-page note. It fails the job only when there is no usable Markdown.
 
+The artifact also contains `.image_provenance.json`. The bridge uses structured image items and
+explicit `image:`/`screenshot:` placeholders to restore missing Markdown image occurrences. It
+records each original filename, category, SHA-256, source page/block/bbox when supplied, every
+occurrence, and a `requires_review` warning when an occurrence cannot be located reliably. Equal
+image bytes share one ZIP entry without merging their occurrence records. After OpenViking commits
+the artifact, its image URI rewrite step fills `final_ov_image_uri` with the stored `viking://`
+URI. Temporary provider download URLs are never emitted as body links or provenance source links.
+
 ## Settings
 
 | Setting | Default | Purpose |

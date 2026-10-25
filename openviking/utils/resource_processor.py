@@ -68,6 +68,7 @@ _PARSE_ARTIFACT_INTERNAL_NAMES = frozenset(
         ".relations.json",
         ".source.json",
         ".image_mappings.json",
+        ".image_provenance.json",
         ".artifact_manifest.json",
     }
 )

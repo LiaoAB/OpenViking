@@ -14,6 +14,7 @@ import hmac
 import io
 import json
 import os
+import re
 import time
 import zipfile
 from contextlib import asynccontextmanager
@@ -35,6 +36,11 @@ SUPPORTED_TIERS = {"cost_effective", "agentic", "agentic_plus"}
 MAX_CACHED_ARTIFACTS = 32
 MAX_CONCURRENT_ARTIFACT_BUILDS = 2
 MAX_CONCURRENT_IMAGE_DOWNLOADS = 8
+IMAGE_PROVENANCE_FILENAME = ".image_provenance.json"
+
+_MARKDOWN_IMAGE = re.compile(r"!\[([^\]]*)\]\(([^\n]+?)\)")
+_HTML_IMAGE = re.compile(r"(<img\s[^>]*?src=[\"'])([^\"']+)([\"'][^>]*>)", re.IGNORECASE)
+_PLACEHOLDER = re.compile(r"^\s*(?P<kind>screenshot|image)\s*:\s*(?P<label>.+?)\s*$", re.IGNORECASE)
 
 
 class BridgeError(RuntimeError):
@@ -277,7 +283,7 @@ class LlamaParseClient:
     async def get_job(self, job_id: str, *, include_result: bool = False) -> dict[str, Any]:
         params = self._scope()
         if include_result:
-            params["expand"] = "markdown_full,markdown,images_content_metadata"
+            params["expand"] = "markdown_full,markdown,images_content_metadata,items,metadata"
         return await self._json_request(
             self.api, "GET", f"/api/v2/parse/{quote(job_id, safe='')}", params=params
         )
@@ -349,16 +355,318 @@ def _safe_image_name(value: Any) -> str:
     return path.name
 
 
-def _make_zip(markdown: str, images: list[tuple[str, bytes]]) -> bytes:
+def _path_basename(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    value = value.strip().strip("<>")
+    if not value:
+        return ""
+    path = urlsplit(value).path
+    return PurePosixPath(path.replace("\\", "/")).name
+
+
+def _bbox_equal(left: Any, right: Any) -> bool:
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    keys = ("x", "y", "w", "h")
+    if not all(key in left and key in right for key in keys):
+        return False
+    try:
+        return all(abs(float(left[key]) - float(right[key])) <= 1e-3 for key in keys)
+    except (TypeError, ValueError):
+        return False
+
+
+def _item_bbox(item: Mapping[str, Any]) -> Any:
+    bbox = item.get("bbox")
+    if isinstance(bbox, list):
+        return next((candidate for candidate in bbox if isinstance(candidate, dict)), None)
+    return bbox
+
+
+def _image_items(result: Mapping[str, Any]) -> list[dict[str, Any]]:  # noqa: C901
+    """Return image items with their page and block position.
+
+    The provider has added fields to image items over time. Keep this reader
+    intentionally tolerant: the stable parts of the contract are ``type``,
+    ``md``, ``bbox`` and the page number.
+    """
+    value = result.get("items")
+    pages = value.get("pages") if isinstance(value, dict) else []
+    if not isinstance(pages, list):
+        return []
+    metadata_value = result.get("metadata")
+    metadata_pages = metadata_value.get("pages") if isinstance(metadata_value, dict) else []
+    metadata_by_page = {
+        page.get("page_number"): page
+        for page in metadata_pages
+        if isinstance(page, dict) and page.get("page_number") is not None
+    }
+
+    found: list[dict[str, Any]] = []
+
+    def visit(item: Any, page_number: Any, block_index: int) -> None:
+        if not isinstance(item, dict):
+            return
+        if str(item.get("type", "")).lower() == "image":
+            found.append(
+                {
+                    "page_number": page_number,
+                    "block_index": block_index,
+                    "bbox": _item_bbox(item),
+                    "page_metadata": metadata_by_page.get(page_number),
+                    "md": item.get("md") if isinstance(item.get("md"), str) else "",
+                    "references": [
+                        item.get(key)
+                        for key in ("url", "image_url", "src", "filename", "name")
+                        if isinstance(item.get(key), str)
+                    ],
+                }
+            )
+        nested = item.get("items")
+        if isinstance(nested, list):
+            for index, child in enumerate(nested):
+                visit(child, page_number, index)
+
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        page_number = page.get("page_number")
+        items = page.get("items")
+        if isinstance(items, list):
+            for index, item in enumerate(items):
+                visit(item, page_number, index)
+    return found
+
+
+def _asset_position(asset: Mapping[str, Any], item: Optional[Mapping[str, Any]]) -> dict[str, Any]:
+    """Copy provider provenance without copying temporary download URLs."""
+    position: dict[str, Any] = {}
+    for key in (
+        "page_number",
+        "slide_number",
+        "block",
+        "block_index",
+        "occurrence",
+        "bbox",
+    ):
+        if key in asset and asset[key] is not None:
+            position[key] = asset[key]
+    if item is not None:
+        for key in ("page_number", "block_index", "bbox"):
+            if key not in position and item.get(key) is not None:
+                position[key] = item[key]
+        if isinstance(item.get("page_metadata"), dict):
+            position["page_metadata"] = item["page_metadata"]
+    return position
+
+
+def _match_image_items(
+    image: Mapping[str, Any], image_items: list[dict[str, Any]], image_count: int
+) -> list[dict[str, Any]]:
+    name = str(image.get("filename", ""))
+    exact = [
+        item
+        for item in image_items
+        if any(_path_basename(reference).casefold() == name.casefold() for reference in item["references"])
+    ]
+    if exact:
+        return exact
+
+    page_number = image.get("page_number")
+    bbox = image.get("bbox")
+    by_position = [
+        item
+        for item in image_items
+        if (page_number is None or item.get("page_number") == page_number)
+        and _bbox_equal(bbox, item.get("bbox"))
+    ]
+    if by_position:
+        return by_position
+
+    # The documented image index is extraction order. Only use it when the
+    # complete image list has the same cardinality; otherwise an index can
+    # silently point at a screenshot or a layout crop.
+    index = image.get("index")
+    if image_count == len(image_items) and isinstance(index, int) and 0 <= index < len(image_items):
+        return [image_items[index]]
+    return []
+
+
+def _fenced_ranges(markdown: str) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    offset = 0
+    fence_start: Optional[int] = None
+    fence_char = ""
+    fence_length = 0
+    for line in markdown.splitlines(keepends=True):
+        match = re.match(r"^\s{0,3}(`{3,}|~{3,})", line)
+        if fence_start is None:
+            if match:
+                fence_start = offset
+                fence_char = match.group(1)[0]
+                fence_length = len(match.group(1))
+        elif match and match.group(1)[0] == fence_char and len(match.group(1)) >= fence_length:
+            ranges.append((fence_start, offset + len(line)))
+            fence_start = None
+        offset += len(line)
+    if fence_start is not None:
+        ranges.append((fence_start, len(markdown)))
+    return ranges
+
+
+def _in_ranges(position: int, ranges: list[tuple[int, int]]) -> bool:
+    return any(start <= position < end for start, end in ranges)
+
+
+def _rewrite_provider_image_refs(markdown: str, image_paths: Mapping[str, str]) -> str:
+    """Turn provider/temporary image links into local artifact links."""
+    protected = _fenced_ranges(markdown)
+
+    def markdown_replacer(match: re.Match[str]) -> str:
+        if _in_ranges(match.start(), protected):
+            return match.group(0)
+        reference = match.group(2).strip()
+        target = image_paths.get(_path_basename(reference).casefold())
+        if target is None:
+            return match.group(0)
+        return f"![{match.group(1)}]({target})"
+
+    def html_replacer(match: re.Match[str]) -> str:
+        if _in_ranges(match.start(), protected):
+            return match.group(0)
+        target = image_paths.get(_path_basename(match.group(2)).casefold())
+        if target is None:
+            return match.group(0)
+        return f"{match.group(1)}{target}{match.group(3)}"
+
+    markdown = _MARKDOWN_IMAGE.sub(markdown_replacer, markdown)
+    return _HTML_IMAGE.sub(html_replacer, markdown)
+
+
+def _markdown_occurrences(markdown: str, image_path: str) -> list[dict[str, Any]]:
+    occurrences: list[dict[str, Any]] = []
+    protected = _fenced_ranges(markdown)
+    for match in _MARKDOWN_IMAGE.finditer(markdown):
+        if _in_ranges(match.start(), protected):
+            continue
+        if _path_basename(match.group(2).strip()).casefold() != image_path.casefold():
+            continue
+        occurrences.append({"line": markdown.count("\n", 0, match.start()) + 1})
+    for match in _HTML_IMAGE.finditer(markdown):
+        if _in_ranges(match.start(), protected):
+            continue
+        if _path_basename(match.group(2).strip()).casefold() != image_path.casefold():
+            continue
+        occurrences.append({"line": markdown.count("\n", 0, match.start()) + 1})
+    return occurrences
+
+
+def _insertion_line(markdown: str, item: Mapping[str, Any]) -> Optional[int]:
+    protected = _fenced_ranges(markdown)
+    anchor = item.get("md")
+    if isinstance(anchor, str) and anchor.strip():
+        position = markdown.find(anchor)
+        if position >= 0 and not _in_ranges(position, protected):
+            return markdown.count("\n", 0, position)
+
+    offset = 0
+    for line_number, line in enumerate(markdown.splitlines(keepends=True), start=0):
+        if not _in_ranges(offset, protected) and _PLACEHOLDER.match(line.rstrip("\r\n")):
+            return line_number
+        offset += len(line)
+    return None
+
+
+def _insert_missing_occurrences(  # noqa: C901
+    markdown: str,
+    assets: list[dict[str, Any]],
+    source_url: Optional[str],
+) -> tuple[str, list[str]]:
+    """Insert only occurrences with an explicit, unique text anchor."""
+    lines = markdown.splitlines(keepends=True)
+    protected = _fenced_ranges(markdown)
+    placeholders = [
+        index
+        for index, line in enumerate(lines)
+        if not _in_ranges(sum(len(previous) for previous in lines[:index]), protected)
+        and _PLACEHOLDER.match(line.rstrip("\r\n"))
+    ]
+    used_lines: set[int] = set()
+    warnings: list[str] = []
+    pending: list[tuple[dict[str, Any], int]] = []
+
+    for asset in assets:
+        if not asset.get("artifact_path"):
+            continue
+        if _markdown_occurrences(markdown, asset["artifact_path"]):
+            continue
+        items = asset["items"]
+        for item in items:
+            line = _insertion_line(markdown, item)
+            if line is not None and line not in used_lines:
+                pending.append((asset, line))
+                used_lines.add(line)
+
+    # A placeholder is a valid, explicit anchor even when the provider did not
+    # return the structured items tree. One-to-one matching prevents a loose
+    # "append every image" fallback.
+    unresolved = [
+        asset
+        for asset in assets
+        if asset.get("artifact_path")
+        and not _markdown_occurrences(markdown, asset["artifact_path"])
+    ]
+    remaining = [asset for asset in unresolved if not any(owner is asset for owner, _ in pending)]
+    free_placeholders = [line for line in placeholders if line not in used_lines]
+    if len(remaining) == len(free_placeholders):
+        for asset, line in zip(remaining, free_placeholders, strict=True):
+            pending.append((asset, line))
+            used_lines.add(line)
+
+    for asset in assets:
+        if not asset.get("artifact_path"):
+            continue
+        if not _markdown_occurrences(markdown, asset["artifact_path"]) and not any(
+            owner is asset for owner, _ in pending
+        ):
+            warnings.append(f"image {asset['original_filename']} has no reliable Markdown occurrence")
+
+    for asset, line in sorted(pending, key=lambda pair: pair[1], reverse=True):
+        label = asset.get("label") or asset["original_filename"]
+        reference = f"![{label}]({asset['artifact_path']})"
+        if source_url:
+            reference = f"[View source document]({source_url})\n\n{reference}"
+        suffix = "" if lines[line].endswith("\n") else "\n"
+        lines[line] = lines[line] + suffix + "\n" + reference + "\n"
+        asset["inserted"] = True
+    return "".join(lines), warnings
+
+
+def _make_zip(
+    markdown: str,
+    images: list[tuple[str, bytes]],
+    provenance: Optional[dict[str, Any]] = None,
+) -> bytes:
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("content.md", markdown.encode())
         for name, content in images:
             archive.writestr(name, content)
+        if provenance is not None:
+            archive.writestr(
+                IMAGE_PROVENANCE_FILENAME,
+                json.dumps(provenance, ensure_ascii=False, indent=2).encode(),
+            )
     return output.getvalue()
 
 
-async def build_artifact(client: LlamaParseClient, job_id: str) -> bytes:
+async def build_artifact(  # noqa: C901
+    client: LlamaParseClient,
+    job_id: str,
+    *,
+    source: Optional[Mapping[str, Any]] = None,
+) -> bytes:
     result = await client.get_job(job_id, include_result=True)
     job = result.get("job")
     if not isinstance(job, dict) or str(job.get("status", "")).upper() != "COMPLETED":
@@ -366,16 +674,28 @@ async def build_artifact(client: LlamaParseClient, job_id: str) -> bytes:
     metadata = result.get("images_content_metadata")
     images_value = metadata.get("images") if isinstance(metadata, dict) else None
     raw_images = images_value if isinstance(images_value, list) else []
-    sources: list[tuple[str, str]] = []
+    assets: list[dict[str, Any]] = []
     names = {"content.md"}
     for image in raw_images:
+        if not isinstance(image, dict):
+            raise LlamaParseError(502, "LlamaParse returned an invalid image metadata entry")
         name = _safe_image_name(image.get("filename") if isinstance(image, dict) else None)
         url = image.get("presigned_url") if isinstance(image, dict) else None
         if name.casefold() in names:
             raise LlamaParseError(502, f"LlamaParse returned duplicate image: {name}")
         if not isinstance(url, str) or not url.startswith("https://"):
             raise LlamaParseError(502, f"LlamaParse image has no secure download URL: {name}")
-        sources.append((name, url))
+        assets.append(
+            {
+                "original_filename": name,
+                "artifact_path": name,
+                "category": image.get("category"),
+                "content_type": image.get("content_type"),
+                "bbox": image.get("bbox"),
+                "metadata": image,
+                "items": [],
+            }
+        )
         names.add(name.casefold())
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_IMAGE_DOWNLOADS)
 
@@ -383,16 +703,157 @@ async def build_artifact(client: LlamaParseClient, job_id: str) -> bytes:
         async with semaphore:
             return await client.download_asset(url)
 
-    tasks = [asyncio.create_task(download(url)) for _, url in sources]
-    try:
-        contents = await asyncio.gather(*tasks)
-    except BaseException:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
-    images = [(source[0], content) for source, content in zip(sources, contents, strict=True)]
-    return await asyncio.to_thread(_make_zip, _markdown(result), images)
+    tasks = [
+        asyncio.create_task(download(image["metadata"]["presigned_url"])) for image in assets
+    ]
+    contents = await asyncio.gather(*tasks, return_exceptions=True)
+    image_bytes: list[tuple[dict[str, Any], bytes]] = []
+    download_warnings: list[str] = []
+    for asset, content in zip(assets, contents, strict=True):
+        if isinstance(content, BaseException):
+            asset["download_error"] = f"{type(content).__name__}: {content}"
+            asset["artifact_path"] = None
+            download_warnings.append(
+                f"image {asset['original_filename']} could not be downloaded; requires_review"
+            )
+            continue
+        image_bytes.append((asset, content))
+
+    # Identical bytes share one artifact file, while every metadata entry and
+    # every body occurrence remains represented in the provenance manifest.
+    canonical_by_hash: dict[str, str] = {}
+    images: list[tuple[str, bytes]] = []
+    for asset, content in image_bytes:
+        digest = hashlib.sha256(content).hexdigest()
+        asset["sha256"] = digest
+        canonical = canonical_by_hash.get(digest)
+        if canonical is None:
+            canonical = asset["artifact_path"]
+            canonical_by_hash[digest] = canonical
+            images.append((canonical, content))
+        asset["artifact_path"] = canonical
+
+    original_markdown = _markdown(result)
+    for asset in assets:
+        asset["original_occurrence_count"] = len(
+            _markdown_occurrences(original_markdown, asset["original_filename"])
+        )
+    image_paths = {
+        asset["original_filename"].casefold(): asset["artifact_path"] for asset in assets
+        if asset.get("artifact_path")
+    }
+    markdown = _rewrite_provider_image_refs(original_markdown, image_paths)
+    image_items = _image_items(result)
+    for asset in assets:
+        asset["items"] = _match_image_items(asset["metadata"], image_items, len(assets))
+        asset["label"] = str(asset.get("category") or "image")
+
+    source_info: dict[str, Any] = {key: value for key, value in (source or {}).items() if value}
+    job_value = result.get("job")
+    if isinstance(job_value, dict):
+        for key in ("source_url", "source_uri", "file_id"):
+            if key not in source_info and job_value.get(key):
+                source_info[key] = job_value[key]
+    source_url = source_info.get("source_url") or source_info.get("source_uri")
+    if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
+        source_url = None
+    markdown_pages = result.get("markdown")
+    successful_pages = [
+        page.get("page_number")
+        for page in (markdown_pages.get("pages", []) if isinstance(markdown_pages, dict) else [])
+        if isinstance(page, dict)
+        and page.get("success") is not False
+        and page.get("page_number") is not None
+    ]
+    if len(successful_pages) == 1:
+        # A single successful page is a safe document-level inference. For a
+        # multi-page document we never guess a page from array position.
+        for asset in assets:
+            if asset["metadata"].get("page_number") is None:
+                asset["metadata"]["page_number"] = successful_pages[0]
+    markdown, warnings = _insert_missing_occurrences(markdown, assets, source_url)
+    warnings.extend(download_warnings)
+
+    provenance_assets: list[dict[str, Any]] = []
+    occurrence_cursor_by_path: dict[str, int] = {}
+    all_occurrences_by_path = {
+        path: _markdown_occurrences(markdown, path)
+        for path in {asset["artifact_path"] for asset in assets if asset.get("artifact_path")}
+    }
+    for asset in assets:
+        artifact_path = asset.get("artifact_path")
+        all_occurrences = all_occurrences_by_path.get(artifact_path, [])
+        occurrence_cursor = occurrence_cursor_by_path.get(artifact_path, 0)
+        occurrence_count = int(asset.get("original_occurrence_count", 0))
+        if asset.get("inserted") and occurrence_count == 0:
+            occurrence_count = 1
+        occurrences = all_occurrences[occurrence_cursor : occurrence_cursor + occurrence_count]
+        if artifact_path:
+            occurrence_cursor_by_path[artifact_path] = occurrence_cursor + occurrence_count
+        item_occurrences = [
+            {
+                "status": "inserted" if asset.get("inserted") else "linked",
+                "markdown_path": "content.md",
+                "markdown_occurrence": occurrence,
+                "source_position": _asset_position(
+                    asset["metadata"], asset["items"][min(index, len(asset["items"]) - 1)]
+                ),
+            }
+            for index, occurrence in enumerate(occurrences)
+            if asset["items"]
+        ]
+        if not item_occurrences and occurrences:
+            item_occurrences = [
+                {
+                    "status": "inserted" if asset.get("inserted") else "linked",
+                    "markdown_path": "content.md",
+                    "markdown_occurrence": occurrence,
+                    "source_position": _asset_position(asset["metadata"], None),
+                }
+                for occurrence in occurrences
+            ]
+        if not item_occurrences and asset["items"]:
+            item_occurrences = [
+                {
+                    "status": "requires_review",
+                    "markdown_path": "content.md",
+                    "source_position": _asset_position(asset["metadata"], item),
+                }
+                for item in asset["items"]
+            ]
+        if not item_occurrences:
+            item_occurrences = [
+                {
+                    "status": "requires_review",
+                    "markdown_path": "content.md",
+                    "source_position": _asset_position(asset["metadata"], None),
+                }
+            ]
+        provenance_assets.append(
+            {
+                "original_filename": asset["original_filename"],
+                "artifact_path": asset["artifact_path"],
+                "sha256": asset.get("sha256"),
+                "category": asset.get("category"),
+                "content_type": asset.get("content_type"),
+                "bbox": asset["metadata"].get("bbox"),
+                "download_error": asset.get("download_error"),
+                "source_occurrences": item_occurrences,
+                # Filled by post-commit image URI rewriting. It is deliberately
+                # not a presigned provider URL.
+                "final_ov_image_uri": None,
+            }
+        )
+
+    manifest = {
+        "schema_version": 1,
+        "job_id": job_id,
+        "source": source_info,
+        "assets": provenance_assets,
+        "warnings": warnings,
+        "requires_review": bool(warnings),
+    }
+    return await asyncio.to_thread(_make_zip, markdown, images, manifest)
 
 
 def _source(payload: dict[str, Any]) -> tuple[str, str]:
@@ -436,6 +897,8 @@ class Bridge:
         self.signer = ArtifactSigner(settings.bridge_api_key, settings.artifact_ttl_seconds)
         self.artifacts: dict[str, tuple[float, bytes]] = {}
         self.builds: dict[str, asyncio.Task[None]] = {}
+        self.file_sources: dict[str, dict[str, Any]] = {}
+        self.job_sources: dict[str, dict[str, Any]] = {}
         self.build_slots = asyncio.Semaphore(MAX_CONCURRENT_ARTIFACT_BUILDS)
 
     def _store_artifact(self, job_id: str, content: bytes) -> None:
@@ -445,7 +908,7 @@ class Bridge:
 
     async def _build_artifact(self, job_id: str) -> None:
         async with self.build_slots:
-            content = await build_artifact(self.client, job_id)
+            content = await build_artifact(self.client, job_id, source=self.job_sources.get(job_id))
         self._store_artifact(job_id, content)
 
     def _build_done(self, job_id: str, task: asyncio.Task[None]) -> None:
@@ -504,6 +967,7 @@ class Bridge:
         result = await self.client.upload_file(filename, file.file, file.content_type)
         if not isinstance(result.get("id"), str) or not result["id"]:
             raise LlamaParseError(502, "LlamaParse file response has no id")
+        self.file_sources[result["id"]] = {"file_id": result["id"], "filename": filename}
         return result
 
     async def create_response(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -515,6 +979,9 @@ class Bridge:
         response_id = result.get("id")
         if not isinstance(response_id, str) or not response_id:
             raise LlamaParseError(502, "LlamaParse create response has no id")
+        self.job_sources[response_id] = (
+            {"source_url": value} if source_name == "source_url" else self.file_sources.get(value, {"file_id": value})
+        )
         return {"id": response_id, "object": "response", "status": "in_progress"}
 
     async def get_response(self, response_id: str) -> dict[str, Any]:

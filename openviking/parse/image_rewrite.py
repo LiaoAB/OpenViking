@@ -25,6 +25,10 @@ _REMOTE_PREFIXES = ("http://", "https://", "viking://", "data:", "ftp://")
 # Sidecar written by MarkdownParser._ingest_local_images at each document root,
 # consumed (and deleted) here. Shared so merge/sync code can recognize it.
 IMAGE_MAPPINGS_FILENAME = ".image_mappings.json"
+# Optional provenance emitted by external Understanding API bridges. Unlike
+# the mapping sidecar, this is retained after rewriting so source occurrences
+# remain auditable.
+IMAGE_PROVENANCE_FILENAME = ".image_provenance.json"
 
 # HTML <img src="..."> embeds, common in markdown for sizing control. Shared
 # with the parser so ingestion and rewriting see the same references.
@@ -253,6 +257,55 @@ async def _discover_mappings(
     return found
 
 
+async def _update_provenance_manifest(viking_fs, mapping_dir: str, ctx=None) -> None:
+    """Attach final VikingFS image URIs to a bridge provenance manifest."""
+    manifest_uri = f"{mapping_dir}/{IMAGE_PROVENANCE_FILENAME}"
+    try:
+        raw = await viking_fs.read_file(manifest_uri, ctx=ctx)
+        manifest = json.loads(raw)
+    except Exception:
+        return
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("assets"), list):
+        return
+
+    changed = False
+    for asset in manifest["assets"]:
+        if not isinstance(asset, dict):
+            continue
+        artifact_path = asset.get("artifact_path")
+        if not isinstance(artifact_path, str) or not artifact_path:
+            continue
+        image_uri = f"{mapping_dir.rstrip('/')}/{artifact_path.lstrip('/')}"
+        try:
+            await viking_fs.stat(image_uri, ctx=ctx)
+        except Exception:
+            continue
+        if asset.get("final_ov_image_uri") != image_uri:
+            asset["final_ov_image_uri"] = image_uri
+            changed = True
+        occurrences = asset.get("source_occurrences")
+        if not isinstance(occurrences, list):
+            continue
+        for occurrence in occurrences:
+            if not isinstance(occurrence, dict):
+                continue
+            if occurrence.get("status") in {"linked", "inserted"} and occurrence.get(
+                "final_ov_image_uri"
+            ) != image_uri:
+                occurrence["final_ov_image_uri"] = image_uri
+                changed = True
+
+    if changed:
+        try:
+            await viking_fs.write_file(
+                manifest_uri,
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+                ctx=ctx,
+            )
+        except Exception as exc:
+            logger.warning(f"[image_rewrite] Failed to update {manifest_uri}: {exc}")
+
+
 async def rewrite_image_uris(
     root_uri: str,
     ctx: Optional[RequestContext] = None,
@@ -293,6 +346,18 @@ async def rewrite_image_uris(
         return {"files_processed": 0, "references_rewritten": 0}
 
     mappings_by_dir = await _discover_mappings(viking_fs, root_prefix, md_uris, ctx)
+
+    # Probe the same ancestor directories for an optional bridge provenance
+    # manifest. It is deliberately independent from image mappings so an
+    # unresolved asset can remain visible as ``requires_review``.
+    provenance_dirs = set(mappings_by_dir)
+    for md_uri in md_uris:
+        directory = md_uri.rsplit("/", 1)[0]
+        while directory == root_prefix or directory.startswith(root_prefix + "/"):
+            provenance_dirs.add(directory)
+            if directory == root_prefix:
+                break
+            directory = directory.rsplit("/", 1)[0]
 
     files_processed = 0
     references_rewritten = 0
@@ -358,6 +423,9 @@ async def rewrite_image_uris(
             logger.warning(
                 f"[image_rewrite] Failed to delete {map_dir}/{IMAGE_MAPPINGS_FILENAME}: {e}"
             )
+
+    for provenance_dir in provenance_dirs:
+        await _update_provenance_manifest(viking_fs, provenance_dir, ctx=ctx)
 
     logger.info(
         f"[image_rewrite] Processed {len(md_uris)} .md files, "

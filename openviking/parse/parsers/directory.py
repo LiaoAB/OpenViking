@@ -31,7 +31,7 @@ from openviking.parse.base import (
     create_parse_result,
 )
 from openviking.parse.gitignore import GitignoreMatcher
-from openviking.parse.image_rewrite import IMAGE_MAPPINGS_FILENAME
+from openviking.parse.image_rewrite import IMAGE_MAPPINGS_FILENAME, IMAGE_PROVENANCE_FILENAME
 from openviking.parse.output import (
     ParseArtifactWriter,
     copy_artifact_tree,
@@ -58,7 +58,7 @@ logger = get_logger(__name__)
 
 # Hidden files a parser's temp tree is allowed to carry through the merge.
 # Everything else hidden stays filtered, like a default ls.
-_MERGE_SIDECAR_ALLOWLIST = frozenset({IMAGE_MAPPINGS_FILENAME})
+_MERGE_SIDECAR_ALLOWLIST = frozenset({IMAGE_MAPPINGS_FILENAME, IMAGE_PROVENANCE_FILENAME})
 
 # DirectoryParser instances share one limiter in the server event loop so
 # concurrent directory imports cannot multiply UnderstandingAPI concurrency.

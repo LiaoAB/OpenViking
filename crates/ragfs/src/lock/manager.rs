@@ -1293,11 +1293,8 @@ impl PathLockManager {
         let descendants = self.provider.scan_descendant_locks(path).await?;
         let now_ns = Self::now_ns();
 
-        let mut metrics = self.metrics.write().await;
-        metrics.descendant_scan_count += 1;
-        metrics.descendant_scan_duration_ns = metrics
-            .descendant_scan_duration_ns
-            .saturating_add(u64::try_from(scan_start.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        let metrics = self.metrics.read().await;
+        metrics.descendant_scan.record(scan_start.elapsed(), &[]);
         drop(metrics);
         debug!(path = %path, descendant_count = descendants.len(), scan_ms = scan_start.elapsed().as_millis() as u64, "scanned descendant pathlock tokens");
 

@@ -12,7 +12,8 @@ from unittest.mock import AsyncMock, Mock
 import httpx
 import pytest
 
-from openviking.connector import auth, delegate as connector_delegate_module
+from openviking.connector import auth
+from openviking.connector import delegate as connector_delegate_module
 from openviking.parse.mode import ParseMode
 from openviking.resource.watch_manager import WatchManager
 from openviking.resource.watch_scheduler import WatchScheduler
@@ -332,6 +333,7 @@ async def test_connector_watch_stores_only_encrypted_replay_state(
         "secret",
         "tos",
         {"tos_prefix": ["tos://bucket/docs/"]},
+        None,
     )
     assert connector_client.submit_doc_add.await_args.kwargs["param_config"] == {
         "tos_prefix": ["tos://bucket/docs/"]
@@ -820,7 +822,7 @@ async def test_git_connector_watch_keeps_args_only_in_encrypted_state(
         task.auth_state,
         account_id="acct",
         path="https://git.example/org/private.git",
-    ) == ("secret", "git", connector_args)
+    ) == ("secret", "git", connector_args, None)
 
 
 @pytest.mark.asyncio
@@ -868,7 +870,7 @@ async def test_connector_watch_allows_plaintext_private_state_without_encryption
         task.auth_state,
         account_id="acct",
         path="tos://bucket/docs/",
-    ) == ("secret", "tos", {})
+    ) == ("secret", "tos", {}, None)
 
 
 @pytest.mark.asyncio
@@ -1030,7 +1032,7 @@ async def test_connector_watch_keeps_running_when_target_is_missing():
 
     service = ResourceService()
     service.refresh_resource = AsyncMock(return_value={"status": "completed"})
-    service._connector.restore_watch_request = AsyncMock(return_value=("secret", "tos", {}))
+    service._connector.restore_watch_request = AsyncMock(return_value=("secret", "tos", {}, None))
     scheduler = WatchScheduler(resource_service=service, viking_fs=MissingTargetFS())
     watch_manager = WatchManager()
     scheduler._watch_manager = watch_manager
@@ -3043,7 +3045,7 @@ async def test_project_oauth_dispatch_and_watch_replay(
         api_key=ctx.api_key, account_id=ctx.account_id, add_type=add_type, path=path, connector_args=args
     )
     for token in ("first", "second"):
-        api_key, restored_type, restored_args = await delegate.restore_watch_request(
+        api_key, restored_type, restored_args, _ = await delegate.restore_watch_request(
             state, account_id=ctx.account_id, path=path
         )
         assert api_key == ctx.api_key
@@ -3120,3 +3122,147 @@ async def test_document_auth_rejects_ambiguous_or_foreign_credentials(patch, mon
             _feishu_request_context(),
         )
     factory.assert_not_called()
+
+
+_DINGTALK_URL = "https://alidocs.dingtalk.com/i/nodes/NODE1"
+
+
+def _dingtalk_credential_ref(**changes):
+    return {
+        "account_id": "acct",
+        "resource_id": "ov-resource",
+        "user_id": "alice",
+        "ov_user_id": "ov-user",
+        "type": "oauth",
+        "platform": "dingtalk",
+        "binding_version": 3,
+        **changes,
+    }
+
+
+def _dingtalk_auth_config(token):
+    return {
+        "auth_mode": "internal_app",
+        "token_scope": "internal_app",
+        "client_id": "ding-client",
+        "client_secret": "ding-secret",
+        "user_access_token": token,
+        "corp_id": "ding-corp",
+        "user_id": "open-id",
+        "operator_id": "union-id",
+    }
+
+
+@pytest.mark.asyncio
+async def test_dingtalk_import_resolves_managed_credential_reference(
+    monkeypatch, connector_config, ctx, service
+):
+    connector_config.allowed_add_types.append("dingtalk")
+    client = SimpleNamespace(submit_doc_add=AsyncMock(return_value={"task_key": "C1"}))
+    _install_connector_dependencies(monkeypatch, _task_tracker(), client)
+    resolve = AsyncMock(return_value=_dingtalk_auth_config("live-token"))
+    monkeypatch.setattr(connector_delegate_module, "resolve_connector_auth_config", resolve)
+
+    result = await service.add_resource(
+        path=_DINGTALK_URL,
+        ctx=ctx,
+        add_type="dingtalk",
+        to="viking://resources/docs",
+        args={"binding_version": 3},
+        connector_auth_config={"openviking_credential_ref": _dingtalk_credential_ref()},
+    )
+
+    assert result["task_id"] == "task-1"
+    payload = client.submit_doc_add.await_args.kwargs
+    assert payload["add_type"] == "dingtalk"
+    # The resolver output is forwarded verbatim as the private auth_config and
+    # never leaks into param_config.
+    assert payload["auth_config"] == _dingtalk_auth_config("live-token")
+    assert "user_access_token" not in str(payload["param_config"])
+    assert payload["param_config"]["path"] == _DINGTALK_URL
+    assert payload["param_config"]["binding_version"] == 3
+    resolve.assert_awaited_once()
+    forwarded_reference = resolve.await_args.args[0]
+    assert forwarded_reference == _dingtalk_credential_ref()
+
+
+@pytest.mark.asyncio
+async def test_dingtalk_watch_replays_reference_and_reresolves_each_round(
+    monkeypatch, connector_config, ctx, service
+):
+    connector_config.allowed_add_types.append("dingtalk")
+    client = SimpleNamespace(submit_doc_add=AsyncMock(return_value={"task_key": "C1"}))
+    _install_connector_dependencies(monkeypatch, _task_tracker(), client)
+    tokens = iter(["round-1", "round-2"])
+    resolve = AsyncMock(side_effect=lambda *_: _dingtalk_auth_config(next(tokens)))
+    monkeypatch.setattr(connector_delegate_module, "resolve_connector_auth_config", resolve)
+
+    delegate = service._connector
+    connector_auth_config = {"openviking_credential_ref": _dingtalk_credential_ref()}
+    state = await delegate.create_watch_auth_state(
+        api_key=ctx.api_key,
+        account_id=ctx.account_id,
+        add_type="dingtalk",
+        path=_DINGTALK_URL,
+        connector_args={"binding_version": 3},
+        connector_auth_config=connector_auth_config,
+    )
+    # Encrypted watch state only persists the secret-free reference.
+    assert "user_access_token" not in json.dumps(state)
+
+    for expected in ("round-1", "round-2"):
+        api_key, add_type, restored_args, restored_ref = await delegate.restore_watch_request(
+            state, account_id=ctx.account_id, path=_DINGTALK_URL
+        )
+        assert api_key == ctx.api_key
+        assert add_type == "dingtalk"
+        assert restored_ref == connector_auth_config
+        await service.refresh_resource(
+            path=_DINGTALK_URL,
+            ctx=ctx,
+            add_type=add_type,
+            to="viking://resources/docs",
+            args=restored_args,
+            connector_auth_config=restored_ref,
+        )
+        assert client.submit_doc_add.await_args.kwargs["auth_config"] == _dingtalk_auth_config(
+            expected
+        )
+    assert resolve.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_managed_reference_without_connector_route_is_rejected(
+    monkeypatch, connector_config, ctx, service
+):
+    # A credential reference must resolve inside Connector delegation; a source
+    # that does not route to the Connector must fail instead of silently
+    # degrading to an unauthorized standard-pipeline import.
+    client = SimpleNamespace(submit_doc_add=AsyncMock(return_value={"task_key": "C1"}))
+    _install_connector_dependencies(monkeypatch, _task_tracker(), client)
+    with pytest.raises(InvalidArgumentError, match="requires a Connector import"):
+        await service.add_resource(
+            path="https://example.com/page",
+            ctx=ctx,
+            to="viking://resources/docs",
+            connector_auth_config={"openviking_credential_ref": _dingtalk_credential_ref()},
+        )
+    client.submit_doc_add.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dingtalk_registry_type_rejects_managed_reference(
+    monkeypatch, connector_config, ctx, service
+):
+    # Registry types (tos/git) carry credentials through their own channels, so
+    # a managed reference on such a declared type is rejected.
+    connector_config.allowed_add_types = ["git"]
+    _install_connector_dependencies(monkeypatch, _task_tracker(), SimpleNamespace())
+    with pytest.raises(InvalidArgumentError, match="does not accept a managed credential reference"):
+        await service._connector.submit(
+            path=_GIT_REPO_PREFIX + "org/repo",
+            ctx=ctx,
+            to="viking://resources/repo",
+            declared_add_type="git",
+            connector_auth_config={"openviking_credential_ref": _dingtalk_credential_ref()},
+        )

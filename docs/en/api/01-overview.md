@@ -432,6 +432,13 @@ This catalog follows the routes actually mounted by the server. Each group headi
 | GET | `/api/v1/agent-evolution/experiences/trajectories` | List trajectories that consumed an Experience |
 | GET | `/api/v1/agent-evolution/experiences/outcomes` | Aggregate outcomes of trajectories that consumed an Experience |
 
+### [Rules (Beta)](26-rules.md)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/v1/rules/compile` | Submit a background rule compilation task |
+| POST | `/api/v1/rules/search` | Retrieve applicable active rules for task context |
+
 ### [Retrieval](06-retrieval.md)
 
 | Method | Path | Description |

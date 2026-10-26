@@ -7,6 +7,7 @@ import pytest
 
 from openviking.parse.image_rewrite import (
     IMAGE_MAPPINGS_FILENAME,
+    IMAGE_PROVENANCE_FILENAME,
     build_artifact_image_mappings,
 )
 from openviking.parse.output import LocalParseOutputStore, read_artifact_manifest
@@ -73,6 +74,10 @@ async def test_unpack_artifact_writes_image_mapping_sidecar(tmp_path: Path):
             f"artifact/{IMAGE_MAPPINGS_FILENAME}",
             '{"untrusted.md":{"bad.png":"bad.png"}}',
         )
+        archive.writestr(
+            f"artifact/{IMAGE_PROVENANCE_FILENAME}",
+            '{"schema_version":1,"assets":[]}',
+        )
 
     fake_fs = _FakeVikingFS()
     api = UnderstandingAPI.__new__(UnderstandingAPI)
@@ -86,6 +91,8 @@ async def test_unpack_artifact_writes_image_mapping_sidecar(tmp_path: Path):
         "Ov测试_1.md": {"Ov测试_1_img1.png": "Ov测试_1_img1.png"}
     }
     assert fake_fs.files[f"{artifact_ref.root}/resource/Ov测试_1_img1.png"] == b"png"
+    provenance_uri = f"{artifact_ref.root}/resource/{IMAGE_PROVENANCE_FILENAME}"
+    assert json.loads(fake_fs.files[provenance_uri]) == {"schema_version": 1, "assets": []}
 
 
 @pytest.mark.asyncio

@@ -123,7 +123,9 @@ async def test_llamaparse_client_maps_upload_parse_poll_and_asset_requests(
             assert payload["tier"] == "agentic"
             assert payload["output_options"]["images_to_save"] == ["embedded", "layout"]
             return httpx.Response(200, json={"id": "job-1"})
-        assert request.url.params["expand"] == ("markdown_full,markdown,images_content_metadata")
+        assert request.url.params["expand"] == (
+            "markdown_full,markdown,images_content_metadata,items,metadata"
+        )
         return httpx.Response(200, json={"job": {"status": "COMPLETED"}})
 
     async def asset_handler(request: httpx.Request) -> httpx.Response:
@@ -324,9 +326,14 @@ async def test_completed_result_is_prebuilt_cached_and_downloadable(
     assert repeated.content == artifact.content
     assert llama.asset_downloads == 1
     with zipfile.ZipFile(io.BytesIO(artifact.content)) as archive:
-        assert archive.namelist() == ["content.md", "chart.png"]
+        assert archive.namelist() == ["content.md", "chart.png", ".image_provenance.json"]
         assert archive.read("content.md").decode() == ("page one\n\n> Page 2 failed to parse.")
         assert archive.read("chart.png") == b"image-bytes"
+        provenance = json.loads(archive.read(".image_provenance.json"))
+        assert provenance["assets"][0]["artifact_path"] == "chart.png"
+        assert provenance["assets"][0]["source_occurrences"][0]["status"] == (
+            "requires_review"
+        )
 
 
 async def test_completed_build_is_cached_without_another_poll(settings: Settings) -> None:
@@ -383,3 +390,74 @@ async def test_build_artifact_fails_when_no_usable_markdown_exists() -> None:
 
     with pytest.raises(LlamaParseError, match="no usable Markdown"):
         await build_artifact(llama, "job-1")  # type: ignore[arg-type]
+
+
+async def test_build_artifact_restores_placeholder_and_writes_provenance(tmp_path) -> None:
+    llama = FakeLlamaParseClient()
+    llama.result = {
+        "job": {"status": "COMPLETED"},
+        "markdown_full": "# Example\n\nimage: settings dialog\n",
+        "markdown": {"pages": [{"page_number": 1, "success": True}]},
+        "images_content_metadata": {
+            "images": [
+                {
+                    "index": 0,
+                    "filename": "img_p1_1.png",
+                    "category": "embedded",
+                    "content_type": "image/png",
+                    "bbox": {"x": 10, "y": 100, "w": 300, "h": 200},
+                    "presigned_url": "https://assets.test/img.png",
+                }
+            ]
+        },
+    }
+
+    artifact = await build_artifact(
+        llama,
+        "job-1",
+        source={"source_url": "https://example.test/guide.docx"},
+    )  # type: ignore[arg-type]
+    with zipfile.ZipFile(io.BytesIO(artifact)) as archive:
+        markdown = archive.read("content.md").decode()
+        assert "image: settings dialog" in markdown
+        assert "![embedded](img_p1_1.png)" in markdown
+        assert "temporary" not in markdown
+        provenance = json.loads(archive.read(".image_provenance.json"))
+
+    asset = provenance["assets"][0]
+    assert asset["category"] == "embedded"
+    assert asset["source_occurrences"][0]["status"] == "inserted"
+    assert asset["source_occurrences"][0]["source_position"]["page_number"] == 1
+    assert provenance["source"]["source_url"] == "https://example.test/guide.docx"
+
+
+async def test_build_artifact_deduplicates_bytes_but_keeps_occurrences() -> None:
+    llama = FakeLlamaParseClient()
+    llama.result = {
+        "job": {"status": "COMPLETED"},
+        "markdown_full": "![first](first.png)\n\n![second](second.png)",
+        "images_content_metadata": {
+            "images": [
+                {
+                    "filename": "first.png",
+                    "category": "embedded",
+                    "presigned_url": "https://assets.test/first.png",
+                },
+                {
+                    "filename": "second.png",
+                    "category": "embedded",
+                    "presigned_url": "https://assets.test/second.png",
+                },
+            ]
+        },
+    }
+
+    artifact = await build_artifact(llama, "job-1")  # type: ignore[arg-type]
+    with zipfile.ZipFile(io.BytesIO(artifact)) as archive:
+        assert archive.namelist() == ["content.md", "first.png", ".image_provenance.json"]
+        provenance = json.loads(archive.read(".image_provenance.json"))
+    assert [asset["artifact_path"] for asset in provenance["assets"]] == [
+        "first.png",
+        "first.png",
+    ]
+    assert all(asset["source_occurrences"][0]["status"] == "linked" for asset in provenance["assets"])

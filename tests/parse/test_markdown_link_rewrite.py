@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Tests for MarkdownParser relative-link rewriting on ingest."""
 
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -769,6 +770,37 @@ class TestRewriteImageUris:
         assert stats == {"files_processed": 1, "references_rewritten": 1}
         assert _decode(fake.files[f"{root}/doc.md"]) == f"![p]({root}/logo.png)"
         assert f"{root}/.image_mappings.json" not in fake.files
+
+    async def test_bridge_provenance_gets_final_viking_uri(self):
+        from openviking.parse.image_rewrite import rewrite_image_uris
+
+        root = "viking://resources/doc"
+        fake = FakeVikingFS()
+        fake.files = {
+            f"{root}/content.md": "![p](image.png)".encode(),
+            f"{root}/image.png": b"img",
+            f"{root}/.image_mappings.json": '{"content.md":{"image.png":"image.png"}}'.encode(),
+            f"{root}/.image_provenance.json": json.dumps(
+                {
+                    "schema_version": 1,
+                    "assets": [
+                        {
+                            "artifact_path": "image.png",
+                            "final_ov_image_uri": None,
+                            "source_occurrences": [{"status": "linked"}],
+                        }
+                    ],
+                }
+            ).encode(),
+        }
+
+        with self._patched(fake):
+            await rewrite_image_uris(root, lease_ref=None)
+
+        manifest = json.loads(fake.files[f"{root}/.image_provenance.json"])
+        asset = manifest["assets"][0]
+        assert asset["final_ov_image_uri"] == f"{root}/image.png"
+        assert asset["source_occurrences"][0]["final_ov_image_uri"] == f"{root}/image.png"
 
     async def test_merge_temp_carries_sidecar_but_not_other_hidden_files(self):
         # _merge_temp must carry the declared .image_mappings.json sidecar, but
